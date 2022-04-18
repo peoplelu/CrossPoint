@@ -1,4 +1,6 @@
 from __future__ import print_function
+import imp
+from multiprocessing import reduction
 import os
 import random
 import argparse
@@ -9,7 +11,7 @@ import wandb
 from lightly.loss.ntx_ent_loss import NTXentLoss
 import time
 from sklearn.svm import SVC
-
+from utils.config import get_config
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -20,8 +22,9 @@ from torch.utils.data import DataLoader
 
 from datasets.data import ShapeNetRender, ModelNet40SVM
 from models.dgcnn import DGCNN, ResNet, DGCNN_partseg
+from models.cycle import *
 from util import IOStream, AverageMeter
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
 
 def _init_():
     if not os.path.exists('checkpoints'):
@@ -44,19 +47,30 @@ def train(args, io):
     train_loader = DataLoader(ShapeNetRender(transform, n_imgs = 2), num_workers=0,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device("cuda:0" if args.cuda else "cpu")
 
     #Try to load models
     if args.model == 'dgcnn':
         point_model = DGCNN(args).to(device)
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+          point_model = nn.DataParallel(point_model,device_ids=[0,1]) 
     elif args.model == 'dgcnn_seg':
         point_model = DGCNN_partseg(args).to(device)
-    else:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+          point_model = nn.DataParallel(point_model,device_ids=[0,1]) 
+    elif args.model == 'cyclenet':
+        cfg = get_config('/ssd/ljh/3d_sem/CrossPoint/cfg/Point-Bert.yaml')
+        
+        point_model = CycleNet(cfg.model).to(device)
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+          point_model = nn.DataParallel(point_model,device_ids=[0,1]) 
+    else: 
         raise Exception("Not implemented")
         
     img_model = ResNet(resnet50(), feat_dim = 2048)
     img_model = img_model.to(device)
-        
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+      img_model = nn.DataParallel(img_model,device_ids=[0,1])     
     wandb.watch(point_model)
     
     if args.resume:
@@ -74,7 +88,8 @@ def train(args, io):
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=0, last_epoch=-1)
     criterion = NTXentLoss(temperature = 0.1).to(device)
-    
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+      criterion = nn.DataParallel(criterion,device_ids=[0,1])  
     best_acc = 0
     for epoch in range(args.start_epoch, args.epochs):
         lr_scheduler.step()
@@ -91,24 +106,31 @@ def train(args, io):
         wandb_log = {}
         print(f'Start training epoch: ({epoch}/{args.epochs})')
         for i, ((data_t1, data_t2), imgs) in enumerate(train_loader):
+            #data_t1:b 2048 3  img: 3, 224, 224
             data_t1, data_t2, imgs = data_t1.to(device), data_t2.to(device), imgs.to(device)
             batch_size = data_t1.size()[0]
             
             opt.zero_grad()
             data = torch.cat((data_t1, data_t2))
-            data = data.transpose(2, 1).contiguous()
-            _, point_feats, _ = point_model(data)
+            
+            #point_feats:2b 256
+            if args.model == 'cyclenet':
+              cls_feature, logits = point_model(data)
+            else:
+              data = data.transpose(2, 1).contiguous()
+              _, point_feats, _ = point_model(data)
+            #b 256
             img_feats = img_model(imgs)
             
             point_t1_feats = point_feats[:batch_size, :]
             point_t2_feats = point_feats[batch_size: , :]
             
-            loss_imid = criterion(point_t1_feats, point_t2_feats)        
+            loss_imid = criterion(point_t1_feats, point_t2_feats).mean()        
             point_feats = torch.stack([point_t1_feats,point_t2_feats]).mean(dim=0)
-            loss_cmid = criterion(point_feats, img_feats)
+            loss_cmid = criterion(point_feats, img_feats).mean()
                 
             total_loss = loss_imid + loss_cmid
-            total_loss.backward()
+            total_loss.backward(total_loss.clone().detach())
             opt.step()
             
             train_losses.update(total_loss.item(), batch_size)
@@ -203,8 +225,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Point Cloud Recognition')
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
-    parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
-                        choices=['dgcnn', 'dgcnn_seg'],
+    parser.add_argument('--model', type=str, default='cyclenet', metavar='N',
+                        choices=['dgcnn', 'dgcnn_seg','cyclenet'],
                         help='Model to use, [pointnet, dgcnn]')
     parser.add_argument('--batch_size', type=int, default=16, metavar='batch_size',
                         help='Size of batch)')
